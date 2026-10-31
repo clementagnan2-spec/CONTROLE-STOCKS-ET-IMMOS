@@ -13,6 +13,9 @@ APP_TITLE = "Contrôle Stocks & Immobilisations"
 DEFAULT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "ControleStocksImmos")
 
 
+SRC = {"article": "Article", "compte": "Moyenne du compte", "classe": "Moyenne de la classe", "aucun": "Aucun (saisir achats)"}
+
+
 class Grid(ttk.Frame):
     """Tableau avec édition par double-clic sur les colonnes éditables."""
 
@@ -303,12 +306,12 @@ class App(tk.Tk):
         ttk.Label(t, foreground="#555", wraplength=1250, justify="left", text=(
             "Les ventes (701 → stock 311, 702 → stock 321) sont rattachées automatiquement à l'article d'achat le plus proche. "
             "Vérifiez le rattachement (« Associer à un article » ou modifier « Article »), puis saisissez la QUANTITÉ vendue. "
-            "Coût de sortie = quantité vendue x CMUP de l'article. Rouge = article non rattaché à un achat ; jaune = quantité manquante."
+            "Coût de sortie = quantité vendue x CMUP de l'article ; si la vente n'est pas rattachée à un article, le CMUP moyen du compte de stock (311, 321...) est utilisé (colonne « Base du CMUP »). Rouge = article non rattaché à un achat ; jaune = quantité manquante."
         )).pack(anchor="w", pady=4)
         cols = [("compte_vente", "Compte vente", 100, "w"), ("compte_stock", "Compte stock", 100, "w"),
                 ("date", "Date", 90, "center"), ("piece", "Pièce", 90, "w"), ("libelle", "Libellé", 260, "w"),
                 ("article", "Article (éditable)", 230, "w"), ("montant", "Prix de vente", 110, "e"),
-                ("quantite", "Qté vendue (éditable)", 140, "e"), ("cmup", "CMUP", 90, "e"),
+                ("quantite", "Qté vendue (éditable)", 140, "e"), ("cmup", "CMUP", 90, "e"), ("src", "Base du CMUP", 130, "w"),
                 ("cout", "Coût de sortie", 110, "e"), ("marge", "Marge brute", 110, "e")]
         self.s_grid = Grid(t, cols, editable=("article", "quantite", "compte_stock"), on_edit=self.edit_sortie)
         self.s_grid.tree.tag_configure("bad", foreground="#b00020")
@@ -370,7 +373,7 @@ class App(tk.Tk):
         q = self.s_filter.get().lower().strip()
         known = {(r[0], r[1]) for r in self.db.c.execute("SELECT DISTINCT compte_stock, article FROM stock_lines")}
         rows = []
-        miss = bad = 0
+        miss = bad = nocmup = 0
         tv = tc = 0.0
         data = self.db.sorties_rows()
         for r in data:
@@ -384,13 +387,18 @@ class App(tk.Tk):
                 bad += 1
                 tags.append("bad")
             vals = (r["compte_vente"], r["compte_stock"], dfmt(r["date"]), r["piece"], r["libelle"], r["article"],
-                    fmt(r["montant"]), fmtq(r["quantite"]), fmt(r["cmup"]), fmt(r["cout"]), fmt(r["marge"]))
+                    fmt(r["montant"]), fmtq(r["quantite"]), fmt(r["cmup"]), SRC.get(r["cmup_src"], ""),
+                    fmt(r["cout"]), fmt(r["marge"]))
+            if r["cmup_src"] == "aucun" or not r["cmup"]:
+                nocmup += 1
             if q and q not in " ".join(map(str, vals)).lower():
                 continue
             rows.append((str(r["id"]), vals, tuple(tags)))
         self.s_grid.reload(rows)
-        self.s_info.config(text=f"{len(data)} ventes | {miss} sans quantité | {bad} non rattachées | "
-                                f"Ventes {fmt(tv)} | Coût des sorties {fmt(tc)} | Marge brute {fmt(tv - tc)}")
+        nq = self.db.c.execute("SELECT COUNT(*) FROM stock_lines WHERE COALESCE(quantite,0)=0").fetchone()[0]
+        self.s_info.config(text=f"{len(data)} ventes | {miss} sans quantité | {bad} non rattachées | {nocmup} sans CMUP | "
+                                f"Ventes {fmt(tv)} | Coût des sorties {fmt(tc)} | Marge brute {fmt(tv - tc)}"
+                                + (f" | ATTENTION : {nq} achat(s) sans quantité (CMUP faussé)" if nq else ""))
 
     # ---- 4. Inventaire / CMUP
     def _tab_inv(self):
@@ -405,7 +413,7 @@ class App(tk.Tk):
         ttk.Label(t, foreground="#555", wraplength=1250, justify="left", text=(
             "CMUP = (valeur du stock initial + achats) / (quantité initiale + quantités achetées). Sorties = quantités vendues x CMUP. "
             "Quantité théorique = initiale + achats - sorties. Saisissez la quantité inventoriée (comptage) : l'écart avec le théorique est calculé, "
-            "et le stock final = quantité inventoriée x CMUP (si non saisie, la quantité théorique est retenue). Jaune = quantité théorique négative ou sortie sans CMUP."
+            "et le stock final = quantité inventoriée x CMUP (si non saisie, la quantité théorique est retenue). Jaune = quantité théorique négative, sortie sans CMUP ou achat sans quantité (CMUP faussé)."
         )).pack(anchor="w", pady=4)
         cols = [("compte", "Compte stock", 100, "w"), ("article", "Article", 240, "w"), ("unite", "Unité", 55, "center"),
                 ("qte_init", "Qté initiale", 85, "e"), ("val_init", "Valeur initiale", 110, "e"),
@@ -435,7 +443,7 @@ class App(tk.Tk):
             tot["vi"] += f["val_init"]
             tot["vs"] += f["v_sort"]
             tot["vf"] += f["v_inv"]
-            warn = f["q_theo"] < -0.0005 or (f["q_sort"] and not f["cmup"])
+            warn = f["q_theo"] < -0.0005 or (f["q_sort"] and not f["cmup"]) or f["sans_qte"]
             rows.append((f"{f['compte']}|{f['article']}",
                          (f["compte"], f["article"], f["unite"], fmtq(f["qte_init"]), fmt(f["val_init"]),
                           fmtq(f["q_ach"]), fmt(f["m_ach"]), fmt(f["cmup"]), fmtq(f["q_sort"]), fmt(f["v_sort"]),

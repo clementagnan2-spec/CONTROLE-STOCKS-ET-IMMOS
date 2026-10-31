@@ -408,16 +408,17 @@ class DB:
         c = self.c
         arts = {(r["compte_stock"], r["article"]): r for r in c.execute("SELECT * FROM stock_articles")}
         ach, sor = {}, {}
-        for r in c.execute("SELECT compte_stock, article, SUM(montant) m, SUM(quantite) q, COUNT(*) n "
+        for r in c.execute("SELECT compte_stock, article, SUM(montant) m, SUM(quantite) q, COUNT(*) n, "
+                           "SUM(CASE WHEN COALESCE(quantite,0)=0 THEN 1 ELSE 0 END) nq "
                            "FROM stock_lines GROUP BY compte_stock, article"):
-            ach[(r["compte_stock"], r["article"])] = (r["m"] or 0.0, r["q"] or 0.0, r["n"])
+            ach[(r["compte_stock"], r["article"])] = (r["m"] or 0.0, r["q"] or 0.0, r["n"], r["nq"] or 0)
         for r in c.execute("SELECT compte_stock, article, SUM(montant) m, SUM(quantite) q, COUNT(*) n "
                            "FROM stock_sorties GROUP BY compte_stock, article"):
             sor[(r["compte_stock"], r["article"])] = (r["m"] or 0.0, r["q"] or 0.0, r["n"])
         out = []
         for key in sorted(set(ach) | set(sor)):
             a = arts.get(key)
-            m_ach, q_ach, nb = ach.get(key, (0.0, 0.0, 0))
+            m_ach, q_ach, nb, nq = ach.get(key, (0.0, 0.0, 0, 0))
             vente, q_sort, nbs = sor.get(key, (0.0, 0.0, 0))
             qi = (a["qte_init"] or 0.0) if a else 0.0
             vi = (a["val_init"] or 0.0) if a else 0.0
@@ -434,7 +435,31 @@ class DB:
                 qte_init=qi, val_init=vi, q_ach=q_ach, m_ach=m_ach, q_tot=q_tot, v_tot=v_tot,
                 cmup=cmup, q_sort=q_sort, vente=vente, v_sort=q_sort * cmup, q_theo=q_theo,
                 qte_inv=qinv, counted=counted, ecart_q=ecart_q, ecart_v=ecart_q * cmup,
-                q_final=q_final, v_inv=q_final * cmup, nb=nb, nbs=nbs))
+                q_final=q_final, v_inv=q_final * cmup, nb=nb, nbs=nbs, sans_qte=nq, cmup_src="article"))
+        # CMUP de repli : article sans achat -> CMUP moyen du compte de stock, puis de la classe (311, 321...)
+        agg_c, agg_k = {}, {}
+        for f in out:
+            if f["q_tot"] > 0:
+                for d, k in ((agg_c, f["compte"]), (agg_k, f["compte"][:3])):
+                    x = d.setdefault(k, [0.0, 0.0])
+                    x[0] += f["v_tot"]
+                    x[1] += f["q_tot"]
+        for f in out:
+            if f["q_tot"] > 0:
+                continue
+            if f["compte"] in agg_c:
+                v, q = agg_c[f["compte"]]
+                src = "compte"
+            elif f["compte"][:3] in agg_k:
+                v, q = agg_k[f["compte"][:3]]
+                src = "classe"
+            else:
+                v, q, src = 0.0, 1.0, "aucun"
+            f["cmup"] = v / q
+            f["cmup_src"] = src
+            f["v_sort"] = f["q_sort"] * f["cmup"]
+            f["ecart_v"] = f["ecart_q"] * f["cmup"]
+            f["v_inv"] = f["q_final"] * f["cmup"]
         return out
 
     def ecritures(self):
@@ -498,6 +523,10 @@ class DB:
                     sc += 0.01 if cs == sd["compte_stock"] else 0
                     if sc > best_sc:
                         best, best_sc = (cs, art), sc
+            if not best:
+                same = [ar for cs, ar in cands if cs == sd["compte_stock"]]
+                if len(same) == 1:
+                    best = (sd["compte_stock"], same[0])
             if best:
                 c.execute("UPDATE stock_sorties SET compte_stock=?, article=? WHERE id=?",
                           (best[0], best[1], sd["id"]))
@@ -506,13 +535,13 @@ class DB:
         return n
 
     def sorties_rows(self):
-        cm = {(f["compte"], f["article"]): f["cmup"] for f in self.fiches()}
+        cm = {(f["compte"], f["article"]): (f["cmup"], f["cmup_src"]) for f in self.fiches()}
         out = []
         for r in self.c.execute("SELECT * FROM stock_sorties ORDER BY compte_stock, article, date, id"):
-            cmup = cm.get((r["compte_stock"], r["article"]), 0.0)
+            cmup, src = cm.get((r["compte_stock"], r["article"]), (0.0, "aucun"))
             cout = (r["quantite"] or 0) * cmup
             d = dict(r)
-            d.update(cmup=cmup, cout=cout, marge=(r["montant"] or 0) - cout)
+            d.update(cmup=cmup, cmup_src=src, cout=cout, marge=(r["montant"] or 0) - cout)
             out.append(d)
         return out
 
@@ -899,7 +928,8 @@ def export_stock_pdf(db, path, individual=False):
             calc = Table([
                 ["Quantité totale (stock initial + achats)", fmtq(f["q_tot"])],
                 ["Valeur totale (stock initial + achats)", fmt(f["v_tot"])],
-                ["CMUP = valeur totale / quantité totale", fmt(f["cmup"])],
+                ["CMUP = valeur totale / quantité totale" if f["cmup_src"] == "article" else
+                 "CMUP moyen du compte de stock (aucun achat sur cet article)", fmt(f["cmup"])],
                 ["Quantité sortie (ventes)", fmtq(f["q_sort"])],
                 ["Coût des sorties = quantité sortie x CMUP", fmt(f["v_sort"])],
                 ["Quantité théorique en stock", fmtq(f["q_theo"]) or "0"],
